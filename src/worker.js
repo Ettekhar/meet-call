@@ -13,6 +13,15 @@
 // Wi-Fi to cellular, a browser suspends a background tab), and without this
 // a dead connection can keep occupying one of the 2 slots — which is what
 // caused two real people to end up paired with the wrong (stale) socket.
+//
+// Each browser tab sends a stable client id ("cid") as a query param when it
+// opens the socket. That id survives a WebSocket reconnect (it's just a JS
+// variable, not tied to the socket), so when a tab's signaling connection
+// drops and reconnects, the Room recognizes "this is the same participant
+// reconnecting" instead of treating it as a brand-new peer joining. That
+// matters a lot: without it, every transient signaling blip made the OTHER
+// browser think someone new had joined and forced it to tear down and
+// renegotiate a perfectly healthy WebRTC call.
 
 const HEARTBEAT_TIMEOUT_MS = 25000; // socket is considered dead if no ping in this long
 const ALARM_INTERVAL_MS = 20000;
@@ -28,10 +37,26 @@ export class Room {
       return new Response('Expected a WebSocket upgrade request', { status: 426 });
     }
 
+    const url = new URL(request.url);
+    const cid = url.searchParams.get('cid') || crypto.randomUUID();
+
     const existingSockets = this.state.getWebSockets();
 
-    if (existingSockets.length >= 2) {
-      // Room already has its two people — reject this connection.
+    // Is one of the existing sockets actually *this same browser tab*
+    // reconnecting (matching cid), rather than a genuinely new participant?
+    let staleSocket = null;
+    for (const ws of existingSockets) {
+      const attachment = ws.deserializeAttachment();
+      if (attachment && attachment.cid === cid) {
+        staleSocket = ws;
+        break;
+      }
+    }
+
+    const otherSockets = existingSockets.filter(ws => ws !== staleSocket);
+
+    if (!staleSocket && otherSockets.length >= 2) {
+      // Room already has its two people, and this is a genuine third party — reject.
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       server.accept();
@@ -40,24 +65,52 @@ export class Room {
       return new Response(null, { status: 101, webSocket: client });
     }
 
+    let reusedPeerId = null;
+    if (staleSocket) {
+      // Same participant reconnecting their signaling socket. Swap the old
+      // socket out quietly — mark it so its close handler doesn't tell the
+      // other side "peer left" (they never actually left).
+      const staleAttachment = staleSocket.deserializeAttachment() || {};
+      reusedPeerId = staleAttachment.id;
+      staleAttachment.replaced = true;
+      try {
+        staleSocket.serializeAttachment(staleAttachment);
+        staleSocket.close(4001, 'Replaced by reconnect');
+      } catch (e) {
+        // already gone, ignore
+      }
+    }
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    const peerId = crypto.randomUUID();
-    server.serializeAttachment({ id: peerId, lastPing: Date.now() });
+    const peerId = reusedPeerId || crypto.randomUUID();
+    server.serializeAttachment({ id: peerId, cid, lastPing: Date.now() });
 
     // acceptWebSocket (Hibernation API) lets the Durable Object go idle
     // between messages instead of staying billed as "active" the whole time.
     this.state.acceptWebSocket(server);
 
+    const occupancy = otherSockets.length + 1;
+
     // Let the new socket know exactly what it walked into — useful for
     // debugging if something ever looks "stuck" again.
-    server.send(JSON.stringify({ type: 'joined', peerId, occupancy: existingSockets.length + 1 }));
+    server.send(JSON.stringify({ type: 'joined', peerId, occupancy, reconnected: !!staleSocket }));
 
-    // Tell whichever peer was already here that someone new joined —
-    // that existing peer becomes the one who creates the WebRTC offer.
-    for (const ws of existingSockets) {
-      ws.send(JSON.stringify({ type: 'peer-joined', peerId }));
+    if (staleSocket) {
+      // Just a signaling reconnect — the other peer's WebRTC connection to
+      // us never dropped, so don't make them renegotiate. Let them know
+      // occupancy is still 2 in case their UI needs it, nothing more.
+      for (const ws of otherSockets) {
+        ws.send(JSON.stringify({ type: 'peer-reconnected' }));
+      }
+    } else {
+      // Genuinely new peer — tell whichever peer was already here that
+      // someone new joined. That existing peer becomes the one who creates
+      // the WebRTC offer.
+      for (const ws of otherSockets) {
+        ws.send(JSON.stringify({ type: 'peer-joined', peerId }));
+      }
     }
 
     await this._ensureAlarmScheduled();
@@ -94,10 +147,14 @@ export class Room {
   }
 
   async webSocketClose(ws, code, reason, wasClean) {
+    const attachment = ws.deserializeAttachment();
+    if (attachment && attachment.replaced) return; // intentional swap on reconnect, other side already told
     this._notifyPeerLeft(ws);
   }
 
   async webSocketError(ws, error) {
+    const attachment = ws.deserializeAttachment();
+    if (attachment && attachment.replaced) return;
     this._notifyPeerLeft(ws);
   }
 
@@ -162,4 +219,3 @@ export default {
     return env.ASSETS.fetch(request);
   }
 };
-

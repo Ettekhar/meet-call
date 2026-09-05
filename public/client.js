@@ -1,7 +1,9 @@
 // ---- DOM ----
 const localVideo = document.getElementById('localVideo');
 const remoteVideo = document.getElementById('remoteVideo');
+const remoteEmptyState = document.getElementById('remoteEmptyState');
 const statusEl = document.getElementById('statusText');
+const statusText2 = document.getElementById('statusText2'); // mirrored inside the big empty-state overlay
 const statusDot = document.getElementById('statusDot');
 const micBtn = document.getElementById('micBtn');
 const camBtn = document.getElementById('camBtn');
@@ -27,6 +29,14 @@ let locationMap = null;
 let locationMarker = null;
 let lastLocationSendTime = 0;
 const LOCATION_MIN_INTERVAL_MS = 15000; // throttle: send at most every 15s
+
+// A stable id for this browser tab, generated once and reused across every
+// signaling WebSocket reconnect (it does NOT change just because the socket
+// dropped and came back). This is what lets the server tell "my own
+// signaling connection blipped" apart from "the other person actually left" —
+// without it, every network hiccup looked like a brand-new peer joining and
+// forced a full call teardown even though the WebRTC connection was fine.
+const CLIENT_ID = (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`);
 
 const config = {
   // Public STUN server so both browsers can find each other over the internet.
@@ -180,7 +190,12 @@ function stopQualityMonitor() {
 
 function setStatus(text, state) {
   statusEl.textContent = text;
+  if (statusText2) statusText2.textContent = text;
   statusDot.className = state || '';
+}
+
+function setRemoteEmptyState(visible) {
+  if (remoteEmptyState) remoteEmptyState.classList.toggle('show', !!visible);
 }
 
 async function init() {
@@ -191,10 +206,25 @@ async function init() {
     });
     localVideo.srcObject = localStream;
     setStatus('Waiting for the other person to join...', 'waiting');
+    setRemoteEmptyState(true);
     connectSignaling();
   } catch (err) {
     setStatus('Could not access camera/mic: ' + err.message, '');
     console.error(err);
+  }
+}
+
+// If the connection genuinely goes bad (not just a signaling blip), we wait
+// this long before actually tearing the call down — gives brief network
+// hiccups (Wi-Fi <-> cellular handoff, a moment of packet loss) a chance to
+// recover on their own instead of flashing "disconnected" at the user.
+const CONNECTION_LOSS_GRACE_MS = 8000;
+let connectionLossTimer = null;
+
+function clearConnectionLossTimer() {
+  if (connectionLossTimer) {
+    clearTimeout(connectionLossTimer);
+    connectionLossTimer = null;
   }
 }
 
@@ -207,17 +237,35 @@ function createPeerConnection() {
 
   peerConnection.ontrack = (event) => {
     remoteVideo.srcObject = event.streams[0];
+    setRemoteEmptyState(false);
     setStatus('Connected', 'connected');
   };
 
   peerConnection.onconnectionstatechange = () => {
-    if (peerConnection.connectionState === 'connected') {
+    const state = peerConnection.connectionState;
+
+    if (state === 'connected') {
+      clearConnectionLossTimer();
+      setStatus('Connected', 'connected');
       capAudioBitrate();
       startQualityMonitor();
-    } else if (peerConnection.connectionState === 'disconnected' ||
-        peerConnection.connectionState === 'failed') {
-      setStatus('Connection lost. Waiting...', 'waiting');
+    } else if (state === 'disconnected' || state === 'failed') {
+      // Don't panic immediately — this fires on brief hiccups too. Show a
+      // soft "reconnecting" state and only actually tear the call down if
+      // it hasn't recovered after a grace period.
+      setStatus('Connection unstable. Reconnecting...', 'waiting');
       stopQualityMonitor();
+      if (!connectionLossTimer) {
+        connectionLossTimer = setTimeout(() => {
+          connectionLossTimer = null;
+          if (peerConnection && (peerConnection.connectionState === 'disconnected' || peerConnection.connectionState === 'failed')) {
+            setStatus('Connection lost. Waiting for the other person...', 'waiting');
+            resetCallState();
+          }
+        }, CONNECTION_LOSS_GRACE_MS);
+      }
+    } else if (state === 'closed') {
+      clearConnectionLossTimer();
     }
   };
 
@@ -283,7 +331,7 @@ const PING_INTERVAL_MS = 10000;
 
 function connectSignaling() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${protocol}//${location.host}/ws`);
+  ws = new WebSocket(`${protocol}//${location.host}/ws?cid=${encodeURIComponent(CLIENT_ID)}`);
 
   ws.onopen = () => {
     startHeartbeat();
@@ -301,8 +349,19 @@ function connectSignaling() {
 
   ws.onclose = () => {
     stopHeartbeat();
-    setStatus('Disconnected. Reconnecting...', 'waiting');
-    resetCallState();
+
+    // IMPORTANT: a dropped signaling socket does NOT mean the call is dead —
+    // the actual video/audio/chat flows peer-to-peer over WebRTC and keeps
+    // working even while we reconnect this side-channel. We used to tear
+    // the whole call down here, which is what caused "connected... then a
+    // few seconds later, gone" — a normal signaling reconnect (or the
+    // server swapping in our new socket on the other end) was being treated
+    // as if the call itself had failed.
+    const callIsActive = peerConnection && peerConnection.connectionState === 'connected';
+    if (!callIsActive) {
+      setStatus('Reconnecting...', 'waiting');
+    }
+
     reconnectTimer = setTimeout(connectSignaling, RECONNECT_DELAY_MS);
   };
 
@@ -346,12 +405,14 @@ function sendSignal(obj) {
 }
 
 function resetCallState() {
+  clearConnectionLossTimer();
   if (peerConnection) {
     peerConnection.close();
     peerConnection = null;
   }
   dataChannel = null;
   remoteVideo.srcObject = null;
+  setRemoteEmptyState(true);
   hideRemoteLocation();
   stopQualityMonitor();
   setRoomOccupancy(1);
@@ -372,10 +433,26 @@ async function handleSignalingMessage(data) {
     return;
   }
 
+  if (data.type === 'peer-reconnected') {
+    // The other browser's signaling socket blipped and came back — our
+    // WebRTC connection to them was never touched, so there's nothing to do.
+    setRoomOccupancy(2);
+    return;
+  }
+
   if (data.type === 'peer-joined') {
     setRoomOccupancy(2);
     isOfferer = true;
     setStatus('Peer joined. Connecting...', 'waiting');
+
+    // Clean up any stale connection before starting a fresh one (defensive —
+    // guards against ever ending up with two overlapping RTCPeerConnections).
+    if (peerConnection) {
+      peerConnection.close();
+      peerConnection = null;
+      dataChannel = null;
+    }
+
     createPeerConnection();
 
     const channel = peerConnection.createDataChannel('data');
@@ -422,20 +499,31 @@ function setRoomOccupancy(count) {
 
 // ---- Mic / camera toggles ----
 
+function setButtonIconState(button, isOff) {
+  button.classList.toggle('active', isOff);
+  const onIcon = button.querySelector('.icon-on');
+  const offIcon = button.querySelector('.icon-off');
+  if (onIcon) onIcon.hidden = isOff;
+  if (offIcon) offIcon.hidden = !isOff;
+}
+
 micBtn.addEventListener('click', () => {
   const track = localStream.getAudioTracks()[0];
   if (!track) return;
   track.enabled = !track.enabled;
-  micBtn.textContent = track.enabled ? 'Mute Mic' : 'Unmute';
-  micBtn.classList.toggle('active', !track.enabled);
+  const isOff = !track.enabled;
+  setButtonIconState(micBtn, isOff);
+  micBtn.title = isOff ? 'Unmute microphone' : 'Mute microphone';
 });
 
 camBtn.addEventListener('click', () => {
   const track = localStream.getVideoTracks()[0];
   if (!track) return;
   track.enabled = !track.enabled;
-  camBtn.textContent = track.enabled ? 'Camera Off' : 'Camera On';
-  camBtn.classList.toggle('active', !track.enabled);
+  const isOff = !track.enabled;
+  setButtonIconState(camBtn, isOff);
+  camBtn.title = isOff ? 'Turn camera on' : 'Turn camera off';
+  localVideo.classList.toggle('cam-off', isOff);
 });
 
 // ---- Chat ----
@@ -471,6 +559,7 @@ chatInput.addEventListener('keydown', (e) => {
 
 chatBtn.addEventListener('click', () => {
   chatPanel.classList.toggle('open');
+  chatBtn.classList.toggle('active', chatPanel.classList.contains('open'));
   if (chatPanel.classList.contains('open')) {
     chatBadge.classList.remove('show');
     chatInput.focus();
@@ -481,6 +570,7 @@ const chatCloseBtn = document.getElementById('chatCloseBtn');
 if (chatCloseBtn) {
   chatCloseBtn.addEventListener('click', () => {
     chatPanel.classList.remove('open');
+    chatBtn.classList.remove('active');
   });
 }
 
@@ -541,8 +631,8 @@ function startSharingLocation() {
     return;
   }
   sharingLocation = true;
-  locBtn.textContent = 'Stop Location';
   locBtn.classList.add('on');
+  locBtn.title = 'Stop sharing location';
 
   sendLocationNow(); // send immediately
 
@@ -566,8 +656,8 @@ function startSharingLocation() {
 
 function stopSharingLocation() {
   sharingLocation = false;
-  locBtn.textContent = 'Location';
   locBtn.classList.remove('on');
+  locBtn.title = 'Share location';
   if (watchId !== null) {
     navigator.geolocation.clearWatch(watchId);
     watchId = null;
