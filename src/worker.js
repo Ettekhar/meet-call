@@ -7,6 +7,15 @@
 // The actual video/audio/chat/location never touches this Worker or the
 // Durable Object — that all flows directly between the two browsers over
 // WebRTC once the connection is set up. This is only the "introduction".
+//
+// A heartbeat keeps the room's occupancy count honest: connections don't
+// always close cleanly (a phone backgrounds the tab, network switches from
+// Wi-Fi to cellular, a browser suspends a background tab), and without this
+// a dead connection can keep occupying one of the 2 slots — which is what
+// caused two real people to end up paired with the wrong (stale) socket.
+
+const HEARTBEAT_TIMEOUT_MS = 25000; // socket is considered dead if no ping in this long
+const ALARM_INTERVAL_MS = 20000;
 
 export class Room {
   constructor(state, env) {
@@ -35,17 +44,23 @@ export class Room {
     const [client, server] = Object.values(pair);
 
     const peerId = crypto.randomUUID();
-    server.serializeAttachment({ id: peerId });
+    server.serializeAttachment({ id: peerId, lastPing: Date.now() });
 
     // acceptWebSocket (Hibernation API) lets the Durable Object go idle
     // between messages instead of staying billed as "active" the whole time.
     this.state.acceptWebSocket(server);
+
+    // Let the new socket know exactly what it walked into — useful for
+    // debugging if something ever looks "stuck" again.
+    server.send(JSON.stringify({ type: 'joined', peerId, occupancy: existingSockets.length + 1 }));
 
     // Tell whichever peer was already here that someone new joined —
     // that existing peer becomes the one who creates the WebRTC offer.
     for (const ws of existingSockets) {
       ws.send(JSON.stringify({ type: 'peer-joined', peerId }));
     }
+
+    await this._ensureAlarmScheduled();
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -55,6 +70,14 @@ export class Room {
     try {
       data = JSON.parse(message);
     } catch (e) {
+      return;
+    }
+
+    if (data.type === 'ping') {
+      const attachment = ws.deserializeAttachment() || {};
+      attachment.lastPing = Date.now();
+      ws.serializeAttachment(attachment);
+      ws.send(JSON.stringify({ type: 'pong' }));
       return;
     }
 
@@ -76,6 +99,39 @@ export class Room {
 
   async webSocketError(ws, error) {
     this._notifyPeerLeft(ws);
+  }
+
+  // Safety net: periodically close any socket that hasn't sent a heartbeat
+  // ping recently, even if the underlying connection never sent a proper
+  // close event. This is what prevents a dead tab from silently occupying
+  // a room slot.
+  async alarm() {
+    const now = Date.now();
+    const sockets = this.state.getWebSockets();
+
+    for (const ws of sockets) {
+      const attachment = ws.deserializeAttachment();
+      const lastPing = (attachment && attachment.lastPing) || 0;
+      if (now - lastPing > HEARTBEAT_TIMEOUT_MS) {
+        try {
+          ws.close(4000, 'Heartbeat timeout');
+        } catch (e) {
+          // already gone, ignore
+        }
+      }
+    }
+
+    const remaining = this.state.getWebSockets();
+    if (remaining.length > 0) {
+      await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+    }
+  }
+
+  async _ensureAlarmScheduled() {
+    const current = await this.state.storage.getAlarm();
+    if (current === null) {
+      await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+    }
   }
 
   _notifyPeerLeft(closedWs) {
@@ -106,3 +162,4 @@ export default {
     return env.ASSETS.fetch(request);
   }
 };
+

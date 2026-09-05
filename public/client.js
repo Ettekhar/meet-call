@@ -277,11 +277,17 @@ function sendData(obj) {
 
 let ws;
 let reconnectTimer = null;
+let pingInterval = null;
 const RECONNECT_DELAY_MS = 2000;
+const PING_INTERVAL_MS = 10000;
 
 function connectSignaling() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${protocol}//${location.host}/ws`);
+
+  ws.onopen = () => {
+    startHeartbeat();
+  };
 
   ws.onmessage = (event) => {
     let data;
@@ -294,6 +300,7 @@ function connectSignaling() {
   };
 
   ws.onclose = () => {
+    stopHeartbeat();
     setStatus('Disconnected. Reconnecting...', 'waiting');
     resetCallState();
     reconnectTimer = setTimeout(connectSignaling, RECONNECT_DELAY_MS);
@@ -303,6 +310,34 @@ function connectSignaling() {
     console.error('Signaling socket error', err);
   };
 }
+
+function startHeartbeat() {
+  stopHeartbeat();
+  pingInterval = setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'ping' }));
+    }
+  }, PING_INTERVAL_MS);
+}
+
+function stopHeartbeat() {
+  if (pingInterval) {
+    clearInterval(pingInterval);
+    pingInterval = null;
+  }
+}
+
+// Mobile browsers often suspend background WebSockets. The moment the tab
+// becomes visible again, check the connection immediately instead of
+// waiting for the close event to eventually surface.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    if (!ws || ws.readyState === WebSocket.CLOSED) {
+      clearTimeout(reconnectTimer);
+      connectSignaling();
+    }
+  }
+});
 
 function sendSignal(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -319,15 +354,26 @@ function resetCallState() {
   remoteVideo.srcObject = null;
   hideRemoteLocation();
   stopQualityMonitor();
+  setRoomOccupancy(1);
 }
 
 async function handleSignalingMessage(data) {
+  if (data.type === 'pong') {
+    return;
+  }
+
+  if (data.type === 'joined') {
+    setRoomOccupancy(data.occupancy);
+    return;
+  }
+
   if (data.type === 'room-full') {
     setStatus('This call already has two people in it. Try again later.', '');
     return;
   }
 
   if (data.type === 'peer-joined') {
+    setRoomOccupancy(2);
     isOfferer = true;
     setStatus('Peer joined. Connecting...', 'waiting');
     createPeerConnection();
@@ -363,9 +409,15 @@ async function handleSignalingMessage(data) {
   }
 
   if (data.type === 'peer-left') {
+    setRoomOccupancy(1);
     setStatus('Other person left. Waiting for them to come back...', 'waiting');
     resetCallState();
   }
+}
+
+function setRoomOccupancy(count) {
+  const el = document.getElementById('roomBadge');
+  if (el) el.textContent = count === 2 ? '2/2 in call' : '1/2 in call';
 }
 
 // ---- Mic / camera toggles ----
@@ -374,7 +426,7 @@ micBtn.addEventListener('click', () => {
   const track = localStream.getAudioTracks()[0];
   if (!track) return;
   track.enabled = !track.enabled;
-  micBtn.textContent = track.enabled ? 'Mute Mic' : 'Unmute Mic';
+  micBtn.textContent = track.enabled ? 'Mute Mic' : 'Unmute';
   micBtn.classList.toggle('active', !track.enabled);
 });
 
@@ -382,7 +434,7 @@ camBtn.addEventListener('click', () => {
   const track = localStream.getVideoTracks()[0];
   if (!track) return;
   track.enabled = !track.enabled;
-  camBtn.textContent = track.enabled ? 'Turn Off Camera' : 'Turn On Camera';
+  camBtn.textContent = track.enabled ? 'Camera Off' : 'Camera On';
   camBtn.classList.toggle('active', !track.enabled);
 });
 
@@ -424,6 +476,13 @@ chatBtn.addEventListener('click', () => {
     chatInput.focus();
   }
 });
+
+const chatCloseBtn = document.getElementById('chatCloseBtn');
+if (chatCloseBtn) {
+  chatCloseBtn.addEventListener('click', () => {
+    chatPanel.classList.remove('open');
+  });
+}
 
 // ---- Location ----
 
@@ -482,7 +541,7 @@ function startSharingLocation() {
     return;
   }
   sharingLocation = true;
-  locBtn.textContent = 'Stop Sharing Location';
+  locBtn.textContent = 'Stop Location';
   locBtn.classList.add('on');
 
   sendLocationNow(); // send immediately
@@ -507,7 +566,7 @@ function startSharingLocation() {
 
 function stopSharingLocation() {
   sharingLocation = false;
-  locBtn.textContent = 'Share Location';
+  locBtn.textContent = 'Location';
   locBtn.classList.remove('on');
   if (watchId !== null) {
     navigator.geolocation.clearWatch(watchId);
