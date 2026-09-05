@@ -1,34 +1,44 @@
 // ---- DOM ----
-const localVideo = document.getElementById('localVideo');
-const remoteVideo = document.getElementById('remoteVideo');
-const remoteEmptyState = document.getElementById('remoteEmptyState');
-const statusEl = document.getElementById('statusText');
-const statusText2 = document.getElementById('statusText2'); // mirrored inside the big empty-state overlay
-const statusDot = document.getElementById('statusDot');
-const micBtn = document.getElementById('micBtn');
-const camBtn = document.getElementById('camBtn');
-const locBtn = document.getElementById('locBtn');
-const chatBtn = document.getElementById('chatBtn');
-const chatBadge = document.getElementById('chatBadge');
-const chatPanel = document.getElementById('chatPanel');
-const chatMessages = document.getElementById('chatMessages');
-const chatInput = document.getElementById('chatInput');
-const chatSendBtn = document.getElementById('chatSendBtn');
-const locationPanel = document.getElementById('locationPanel');
-const locationInfo = document.getElementById('locationInfo');
-const qualityBadge = document.getElementById('qualityBadge');
+const localVideo = document.getElementById("localVideo");
+const remoteVideo = document.getElementById("remoteVideo");
+const remoteEmptyState = document.getElementById("remoteEmptyState");
+const statusEl = document.getElementById("statusText");
+const statusText2 = document.getElementById("statusText2"); // mirrored inside the big empty-state overlay
+const statusDot = document.getElementById("statusDot");
+const micBtn = document.getElementById("micBtn");
+const camBtn = document.getElementById("camBtn");
+const locBtn = document.getElementById("locBtn");
+const chatBtn = document.getElementById("chatBtn");
+const chatBadge = document.getElementById("chatBadge");
+const chatPanel = document.getElementById("chatPanel");
+const chatMessages = document.getElementById("chatMessages");
+const chatInput = document.getElementById("chatInput");
+const chatSendBtn = document.getElementById("chatSendBtn");
+const locationPanel = document.getElementById("locationPanel");
+const locationInfo = document.getElementById("locationInfo");
+const qualityBadge = document.getElementById("qualityBadge");
+const roomCodeBadge = document.getElementById("roomCodeBadge");
+const inviteBtn = document.getElementById("inviteBtn");
+const joinOverlay = document.getElementById("joinOverlay");
+const roomCodeInput = document.getElementById("roomCodeInput");
+const joinBtn = document.getElementById("joinBtn");
+const shareLinkInput = document.getElementById("shareLinkInput");
+const copyLinkBtn = document.getElementById("copyLinkBtn");
 
 // ---- State ----
 let localStream;
 let peerConnection;
-let dataChannel;          // outgoing/local end of the data channel
-let isOfferer = false;    // the peer who was already here creates the offer + data channel
-let watchId = null;       // geolocation watch handle
+let dataChannel; // outgoing/local end of the data channel
+let isOfferer = false; // the peer who was already here creates the offer + data channel
+let watchId = null; // geolocation watch handle
 let sharingLocation = false;
 let locationMap = null;
 let locationMarker = null;
 let lastLocationSendTime = 0;
 const LOCATION_MIN_INTERVAL_MS = 15000; // throttle: send at most every 15s
+
+let ROOM_CODE = null; // the "port number" — matching codes land in the same room
+let myPeerId = null; // this tab's id as assigned by the server, used to tell "me" vs "them" in chat history
 
 // A stable id for this browser tab, generated once and reused across every
 // signaling WebSocket reconnect (it does NOT change just because the socket
@@ -36,14 +46,160 @@ const LOCATION_MIN_INTERVAL_MS = 15000; // throttle: send at most every 15s
 // signaling connection blipped" apart from "the other person actually left" —
 // without it, every network hiccup looked like a brand-new peer joining and
 // forced a full call teardown even though the WebRTC connection was fine.
-const CLIENT_ID = (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`);
+const CLIENT_ID = crypto.randomUUID
+  ? crypto.randomUUID()
+  : `${Date.now()}-${Math.random()}`;
+
+// ---- Room code ("port number") ----
+// Two browsers only ever end up in the same call if they use the exact same
+// code — different codes are fully separate rooms on the backend (separate
+// Durable Object instances), so there's no way for a typo'd or mismatched
+// code to accidentally cross wires with someone else's call.
+const ROOM_STORAGE_KEY = "meet-last-room-code";
+const ADJECTIVES = [
+  "blue",
+  "red",
+  "green",
+  "gold",
+  "quiet",
+  "swift",
+  "lucky",
+  "calm",
+  "bright",
+  "sunny",
+];
+const NOUNS = [
+  "fox",
+  "wolf",
+  "otter",
+  "hawk",
+  "lynx",
+  "panda",
+  "tiger",
+  "crane",
+  "heron",
+  "falcon",
+];
+
+function normalizeRoomCode(raw) {
+  return (raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "")
+    .slice(0, 32);
+}
+
+function randomRoomCode() {
+  const a = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
+  const n = NOUNS[Math.floor(Math.random() * NOUNS.length)];
+  const num = Math.floor(Math.random() * 90 + 10);
+  return `${a}-${n}-${num}`;
+}
+
+function inviteUrlFor(code) {
+  const url = new URL(location.href);
+  url.search = "";
+  url.searchParams.set("room", code);
+  return url.toString();
+}
+
+function updateRoomUi(code) {
+  if (roomCodeBadge) roomCodeBadge.textContent = code ? `Room: ${code}` : "";
+  if (shareLinkInput) shareLinkInput.value = code ? inviteUrlFor(code) : "";
+}
+
+async function copyToClipboard(text, onSuccessEl) {
+  try {
+    await navigator.clipboard.writeText(text);
+    if (onSuccessEl) {
+      onSuccessEl.classList.add("on");
+      setTimeout(() => onSuccessEl.classList.remove("on"), 1500);
+    }
+  } catch (e) {
+    // Clipboard API can fail (permissions, non-secure context) — fall back
+    // to showing the link so the person can copy it manually.
+    window.prompt("Copy this invite link:", text);
+  }
+}
+
+function copyInviteLink() {
+  if (!ROOM_CODE) return;
+  copyToClipboard(inviteUrlFor(ROOM_CODE), inviteBtn);
+}
+
+function startCall(code) {
+  const normalized = normalizeRoomCode(code) || randomRoomCode();
+  ROOM_CODE = normalized;
+  try {
+    localStorage.setItem(ROOM_STORAGE_KEY, normalized);
+  } catch (e) {
+    /* private browsing, ignore */
+  }
+
+  const url = new URL(location.href);
+  url.searchParams.set("room", normalized);
+  history.replaceState(null, "", url.toString());
+
+  updateRoomUi(normalized);
+  if (joinOverlay) joinOverlay.classList.add("hidden");
+  init();
+}
+
+(function setupJoinScreen() {
+  const params = new URLSearchParams(location.search);
+  const urlRoom = normalizeRoomCode(params.get("room"));
+
+  if (urlRoom) {
+    // Came in via a shared invite link — join straight away, no risk of a
+    // mistyped code since it's copied verbatim from the link.
+    startCall(urlRoom);
+    return;
+  }
+
+  let savedRoom = "";
+  try {
+    savedRoom = normalizeRoomCode(localStorage.getItem(ROOM_STORAGE_KEY) || "");
+  } catch (e) {
+    /* ignore */
+  }
+  const suggested = savedRoom || randomRoomCode();
+
+  if (roomCodeInput) roomCodeInput.value = suggested;
+  updateRoomUi(suggested);
+
+  if (roomCodeInput) {
+    roomCodeInput.addEventListener("input", () => {
+      updateRoomUi(normalizeRoomCode(roomCodeInput.value));
+    });
+  }
+
+  if (joinBtn) {
+    joinBtn.addEventListener("click", () => {
+      startCall(roomCodeInput ? roomCodeInput.value : "");
+    });
+  }
+
+  if (roomCodeInput) {
+    roomCodeInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") startCall(roomCodeInput.value);
+    });
+  }
+})();
+
+if (inviteBtn) inviteBtn.addEventListener("click", copyInviteLink);
+if (copyLinkBtn) {
+  copyLinkBtn.addEventListener("click", () => {
+    const code =
+      normalizeRoomCode(roomCodeInput ? roomCodeInput.value : "") ||
+      randomRoomCode();
+    copyToClipboard(inviteUrlFor(code), copyLinkBtn);
+  });
+}
 
 const config = {
   // Public STUN server so both browsers can find each other over the internet.
   // Just NAT traversal, not an authentication/security layer.
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' }
-  ]
+  iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
 };
 
 // ---- Adaptive video quality ----
@@ -51,26 +207,48 @@ const config = {
 // "balanced" degradation preference lets the browser trade off resolution
 // vs framerate smoothly within whatever tier is active.
 const QUALITY_TIERS = {
-  high:   { label: 'High',   maxBitrate: 2000000, width: 1280, height: 720, frameRate: 30 },
-  medium: { label: 'Medium', maxBitrate: 700000,  width: 640,  height: 480, frameRate: 24 },
-  low:    { label: 'Low',    maxBitrate: 200000,  width: 320,  height: 240, frameRate: 15 }
+  high: {
+    label: "High",
+    maxBitrate: 2000000,
+    width: 1280,
+    height: 720,
+    frameRate: 30,
+  },
+  medium: {
+    label: "Medium",
+    maxBitrate: 700000,
+    width: 640,
+    height: 480,
+    frameRate: 24,
+  },
+  low: {
+    label: "Low",
+    maxBitrate: 200000,
+    width: 320,
+    height: 240,
+    frameRate: 15,
+  },
 };
 const AUDIO_MAX_BITRATE = 32000; // 32kbps is plenty for voice, leaves more headroom for video
 
-let currentQuality = 'high';
-let qualitySamples = [];      // recent readings, used for hysteresis so quality doesn't flap
+let currentQuality = "high";
+let qualitySamples = []; // recent readings, used for hysteresis so quality doesn't flap
 let statsInterval = null;
 const STATS_CHECK_INTERVAL_MS = 3000;
 const HYSTERESIS_SAMPLES = 3; // require this many consecutive matching readings before switching
 
 function getVideoSender() {
   if (!peerConnection) return null;
-  return peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
+  return peerConnection
+    .getSenders()
+    .find((s) => s.track && s.track.kind === "video");
 }
 
 function getAudioSender() {
   if (!peerConnection) return null;
-  return peerConnection.getSenders().find(s => s.track && s.track.kind === 'audio');
+  return peerConnection
+    .getSenders()
+    .find((s) => s.track && s.track.kind === "audio");
 }
 
 async function capAudioBitrate() {
@@ -78,11 +256,12 @@ async function capAudioBitrate() {
   if (!sender) return;
   try {
     const params = sender.getParameters();
-    if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+    if (!params.encodings || params.encodings.length === 0)
+      params.encodings = [{}];
     params.encodings[0].maxBitrate = AUDIO_MAX_BITRATE;
     await sender.setParameters(params);
   } catch (e) {
-    console.warn('Could not cap audio bitrate', e);
+    console.warn("Could not cap audio bitrate", e);
   }
 }
 
@@ -99,12 +278,13 @@ async function applyQualityTier(tierName) {
   if (sender) {
     try {
       const params = sender.getParameters();
-      if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+      if (!params.encodings || params.encodings.length === 0)
+        params.encodings = [{}];
       params.encodings[0].maxBitrate = tier.maxBitrate;
-      params.degradationPreference = 'balanced';
+      params.degradationPreference = "balanced";
       await sender.setParameters(params);
     } catch (e) {
-      console.warn('Could not set encoding parameters', e);
+      console.warn("Could not set encoding parameters", e);
     }
   }
 
@@ -114,11 +294,11 @@ async function applyQualityTier(tierName) {
       await videoTrack.applyConstraints({
         width: { ideal: tier.width },
         height: { ideal: tier.height },
-        frameRate: { ideal: tier.frameRate }
+        frameRate: { ideal: tier.frameRate },
       });
     } catch (e) {
       // Some cameras reject exact constraint changes — non-fatal, bitrate cap still applies.
-      console.warn('applyConstraints failed', e);
+      console.warn("applyConstraints failed", e);
     }
   }
 
@@ -135,12 +315,18 @@ async function checkNetworkAndAdjust() {
 
   try {
     const stats = await peerConnection.getStats();
-    stats.forEach(report => {
-      if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.nominated) {
-        if (typeof report.currentRoundTripTime === 'number') rtt = report.currentRoundTripTime;
-        if (typeof report.availableOutgoingBitrate === 'number') availableBitrate = report.availableOutgoingBitrate;
+    stats.forEach((report) => {
+      if (
+        report.type === "candidate-pair" &&
+        report.state === "succeeded" &&
+        report.nominated
+      ) {
+        if (typeof report.currentRoundTripTime === "number")
+          rtt = report.currentRoundTripTime;
+        if (typeof report.availableOutgoingBitrate === "number")
+          availableBitrate = report.availableOutgoingBitrate;
       }
-      if (report.type === 'remote-inbound-rtp' && report.kind === 'video') {
+      if (report.type === "remote-inbound-rtp" && report.kind === "video") {
         const lost = report.packetsLost || 0;
         const total = lost + (report.packetsSent || lost || 1);
         if (total > 0) packetLossRatio = lost / total;
@@ -150,22 +336,30 @@ async function checkNetworkAndAdjust() {
     return;
   }
 
-  let target = 'high';
+  let target = "high";
   const bitrateKnown = availableBitrate != null;
 
-  if ((bitrateKnown && availableBitrate < 250000) || (rtt !== null && rtt > 0.4) || packetLossRatio > 0.08) {
-    target = 'low';
-  } else if ((bitrateKnown && availableBitrate < 900000) || (rtt !== null && rtt > 0.2) || packetLossRatio > 0.03) {
-    target = 'medium';
+  if (
+    (bitrateKnown && availableBitrate < 250000) ||
+    (rtt !== null && rtt > 0.4) ||
+    packetLossRatio > 0.08
+  ) {
+    target = "low";
+  } else if (
+    (bitrateKnown && availableBitrate < 900000) ||
+    (rtt !== null && rtt > 0.2) ||
+    packetLossRatio > 0.03
+  ) {
+    target = "medium";
   } else {
-    target = 'high';
+    target = "high";
   }
 
   qualitySamples.push(target);
   if (qualitySamples.length > HYSTERESIS_SAMPLES) qualitySamples.shift();
 
   const enoughSamples = qualitySamples.length === HYSTERESIS_SAMPLES;
-  const allAgree = enoughSamples && qualitySamples.every(q => q === target);
+  const allAgree = enoughSamples && qualitySamples.every((q) => q === target);
 
   if (allAgree && target !== currentQuality) {
     applyQualityTier(target);
@@ -183,33 +377,41 @@ function stopQualityMonitor() {
     clearInterval(statsInterval);
     statsInterval = null;
   }
-  currentQuality = 'high';
+  currentQuality = "high";
   qualitySamples = [];
-  updateQualityBadge('');
+  updateQualityBadge("");
 }
 
 function setStatus(text, state) {
   statusEl.textContent = text;
   if (statusText2) statusText2.textContent = text;
-  statusDot.className = state || '';
+  statusDot.className = state || "";
 }
 
 function setRemoteEmptyState(visible) {
-  if (remoteEmptyState) remoteEmptyState.classList.toggle('show', !!visible);
+  if (remoteEmptyState) remoteEmptyState.classList.toggle("show", !!visible);
 }
 
 async function init() {
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      video: {
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        frameRate: { ideal: 30 },
+      },
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
     });
     localVideo.srcObject = localStream;
-    setStatus('Waiting for the other person to join...', 'waiting');
+    setStatus("Waiting for the other person to join...", "waiting");
     setRemoteEmptyState(true);
     connectSignaling();
   } catch (err) {
-    setStatus('Could not access camera/mic: ' + err.message, '');
+    setStatus("Could not access camera/mic: " + err.message, "");
     console.error(err);
   }
 }
@@ -231,47 +433,57 @@ function clearConnectionLossTimer() {
 function createPeerConnection() {
   peerConnection = new RTCPeerConnection(config);
 
-  localStream.getTracks().forEach(track => {
+  localStream.getTracks().forEach((track) => {
     peerConnection.addTrack(track, localStream);
   });
 
   peerConnection.ontrack = (event) => {
     remoteVideo.srcObject = event.streams[0];
     setRemoteEmptyState(false);
-    setStatus('Connected', 'connected');
+    setStatus("Connected", "connected");
   };
 
   peerConnection.onconnectionstatechange = () => {
     const state = peerConnection.connectionState;
 
-    if (state === 'connected') {
+    if (state === "connected") {
       clearConnectionLossTimer();
-      setStatus('Connected', 'connected');
+      setStatus("Connected", "connected");
       capAudioBitrate();
       startQualityMonitor();
-    } else if (state === 'disconnected' || state === 'failed') {
+    } else if (state === "disconnected" || state === "failed") {
       // Don't panic immediately — this fires on brief hiccups too. Show a
       // soft "reconnecting" state and only actually tear the call down if
       // it hasn't recovered after a grace period.
-      setStatus('Connection unstable. Reconnecting...', 'waiting');
+      setStatus("Connection unstable. Reconnecting...", "waiting");
       stopQualityMonitor();
       if (!connectionLossTimer) {
         connectionLossTimer = setTimeout(() => {
           connectionLossTimer = null;
-          if (peerConnection && (peerConnection.connectionState === 'disconnected' || peerConnection.connectionState === 'failed')) {
-            setStatus('Connection lost. Waiting for the other person...', 'waiting');
+          if (
+            peerConnection &&
+            (peerConnection.connectionState === "disconnected" ||
+              peerConnection.connectionState === "failed")
+          ) {
+            setStatus(
+              "Connection lost. Waiting for the other person...",
+              "waiting",
+            );
             resetCallState();
           }
         }, CONNECTION_LOSS_GRACE_MS);
       }
-    } else if (state === 'closed') {
+    } else if (state === "closed") {
       clearConnectionLossTimer();
     }
   };
 
   peerConnection.onicecandidate = (event) => {
     if (event.candidate) {
-      sendSignal({ type: 'signal', signal: { type: 'candidate', candidate: event.candidate } });
+      sendSignal({
+        type: "signal",
+        signal: { type: "candidate", candidate: event.candidate },
+      });
     }
   };
 
@@ -285,7 +497,7 @@ function setupDataChannel(channel) {
   dataChannel = channel;
 
   dataChannel.onopen = () => {
-    console.log('Data channel open');
+    console.log("Data channel open");
     // Re-send our current location state so the other side is up to date.
     if (sharingLocation) sendLocationNow();
   };
@@ -302,20 +514,18 @@ function setupDataChannel(channel) {
 }
 
 function handleIncomingMessage(msg) {
-  if (msg.type === 'chat') {
-    addChatMessage(msg.text, 'them', msg.timestamp);
-    if (!chatPanel.classList.contains('open')) {
-      chatBadge.classList.add('show');
-    }
-  } else if (msg.type === 'location') {
+  // Chat travels over the signaling WebSocket now, not this data channel —
+  // see handleSignalingMessage()'s 'chat' case — so it can be persisted
+  // server-side and doesn't depend on the peer-to-peer connection being up.
+  if (msg.type === "location") {
     showRemoteLocation(msg.lat, msg.lng, msg.timestamp);
-  } else if (msg.type === 'location-off') {
+  } else if (msg.type === "location-off") {
     hideRemoteLocation();
   }
 }
 
 function sendData(obj) {
-  if (dataChannel && dataChannel.readyState === 'open') {
+  if (dataChannel && dataChannel.readyState === "open") {
     dataChannel.send(JSON.stringify(obj));
   }
 }
@@ -329,12 +539,23 @@ let pingInterval = null;
 const RECONNECT_DELAY_MS = 2000;
 const PING_INTERVAL_MS = 10000;
 
+// Chat messages sent while the signaling socket happens to be reconnecting
+// are queued instead of dropped, and flushed the moment it's back open.
+let pendingChatQueue = [];
+
 function connectSignaling() {
-  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${protocol}//${location.host}/ws?cid=${encodeURIComponent(CLIENT_ID)}`);
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const roomParam = encodeURIComponent(ROOM_CODE || "default");
+  ws = new WebSocket(
+    `${protocol}//${location.host}/ws?cid=${encodeURIComponent(CLIENT_ID)}&room=${roomParam}`,
+  );
 
   ws.onopen = () => {
     startHeartbeat();
+    if (pendingChatQueue.length) {
+      pendingChatQueue.forEach((obj) => ws.send(JSON.stringify(obj)));
+      pendingChatQueue = [];
+    }
   };
 
   ws.onmessage = (event) => {
@@ -357,16 +578,17 @@ function connectSignaling() {
     // few seconds later, gone" — a normal signaling reconnect (or the
     // server swapping in our new socket on the other end) was being treated
     // as if the call itself had failed.
-    const callIsActive = peerConnection && peerConnection.connectionState === 'connected';
+    const callIsActive =
+      peerConnection && peerConnection.connectionState === "connected";
     if (!callIsActive) {
-      setStatus('Reconnecting...', 'waiting');
+      setStatus("Reconnecting...", "waiting");
     }
 
     reconnectTimer = setTimeout(connectSignaling, RECONNECT_DELAY_MS);
   };
 
   ws.onerror = (err) => {
-    console.error('Signaling socket error', err);
+    console.error("Signaling socket error", err);
   };
 }
 
@@ -374,7 +596,7 @@ function startHeartbeat() {
   stopHeartbeat();
   pingInterval = setInterval(() => {
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'ping' }));
+      ws.send(JSON.stringify({ type: "ping" }));
     }
   }, PING_INTERVAL_MS);
 }
@@ -389,8 +611,8 @@ function stopHeartbeat() {
 // Mobile browsers often suspend background WebSockets. The moment the tab
 // becomes visible again, check the connection immediately instead of
 // waiting for the close event to eventually surface.
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') {
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
     if (!ws || ws.readyState === WebSocket.CLOSED) {
       clearTimeout(reconnectTimer);
       connectSignaling();
@@ -401,6 +623,16 @@ document.addEventListener('visibilitychange', () => {
 function sendSignal(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(obj));
+  }
+}
+
+function sendChatToServer(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+  } else {
+    // Socket is mid-reconnect — queue it and flush on the next ws.onopen
+    // instead of silently losing the message.
+    pendingChatQueue.push(obj);
   }
 }
 
@@ -419,31 +651,43 @@ function resetCallState() {
 }
 
 async function handleSignalingMessage(data) {
-  if (data.type === 'pong') {
+  if (data.type === "pong") {
     return;
   }
 
-  if (data.type === 'joined') {
+  if (data.type === "joined") {
+    myPeerId = data.peerId;
     setRoomOccupancy(data.occupancy);
+    renderChatHistory(data.history || []);
     return;
   }
 
-  if (data.type === 'room-full') {
-    setStatus('This call already has two people in it. Try again later.', '');
+  if (data.type === "room-full") {
+    setStatus("This call already has two people in it. Try again later.", "");
     return;
   }
 
-  if (data.type === 'peer-reconnected') {
+  if (data.type === "chat") {
+    // Always from the other person — the server never echoes our own
+    // messages back to us (see sendChat()).
+    addChatMessage(data.message.text, "them", data.message.timestamp);
+    if (!chatPanel.classList.contains("open")) {
+      chatBadge.classList.add("show");
+    }
+    return;
+  }
+
+  if (data.type === "peer-reconnected") {
     // The other browser's signaling socket blipped and came back — our
     // WebRTC connection to them was never touched, so there's nothing to do.
     setRoomOccupancy(2);
     return;
   }
 
-  if (data.type === 'peer-joined') {
+  if (data.type === "peer-joined") {
     setRoomOccupancy(2);
     isOfferer = true;
-    setStatus('Peer joined. Connecting...', 'waiting');
+    setStatus("Peer joined. Connecting...", "waiting");
 
     // Clean up any stale connection before starting a fresh one (defensive —
     // guards against ever ending up with two overlapping RTCPeerConnections).
@@ -455,122 +699,146 @@ async function handleSignalingMessage(data) {
 
     createPeerConnection();
 
-    const channel = peerConnection.createDataChannel('data');
+    const channel = peerConnection.createDataChannel("data");
     setupDataChannel(channel);
 
     const offer = await peerConnection.createOffer();
     await peerConnection.setLocalDescription(offer);
-    sendSignal({ type: 'signal', signal: { type: 'offer', sdp: offer } });
+    sendSignal({ type: "signal", signal: { type: "offer", sdp: offer } });
     return;
   }
 
-  if (data.type === 'signal') {
+  if (data.type === "signal") {
     const signal = data.signal;
 
-    if (signal.type === 'offer') {
+    if (signal.type === "offer") {
       if (!peerConnection) createPeerConnection();
-      await peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+      await peerConnection.setRemoteDescription(
+        new RTCSessionDescription(signal.sdp),
+      );
       const answer = await peerConnection.createAnswer();
       await peerConnection.setLocalDescription(answer);
-      sendSignal({ type: 'signal', signal: { type: 'answer', sdp: answer } });
-    } else if (signal.type === 'answer') {
-      await peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-    } else if (signal.type === 'candidate') {
+      sendSignal({ type: "signal", signal: { type: "answer", sdp: answer } });
+    } else if (signal.type === "answer") {
+      await peerConnection.setRemoteDescription(
+        new RTCSessionDescription(signal.sdp),
+      );
+    } else if (signal.type === "candidate") {
       try {
-        await peerConnection.addIceCandidate(new RTCIceCandidate(signal.candidate));
+        await peerConnection.addIceCandidate(
+          new RTCIceCandidate(signal.candidate),
+        );
       } catch (err) {
-        console.error('Error adding ICE candidate', err);
+        console.error("Error adding ICE candidate", err);
       }
     }
     return;
   }
 
-  if (data.type === 'peer-left') {
+  if (data.type === "peer-left") {
     setRoomOccupancy(1);
-    setStatus('Other person left. Waiting for them to come back...', 'waiting');
+    setStatus("Other person left. Waiting for them to come back...", "waiting");
     resetCallState();
   }
 }
 
 function setRoomOccupancy(count) {
-  const el = document.getElementById('roomBadge');
-  if (el) el.textContent = count === 2 ? '2/2 in call' : '1/2 in call';
+  const el = document.getElementById("roomBadge");
+  if (el) el.textContent = count === 2 ? "2/2 in call" : "1/2 in call";
 }
 
 // ---- Mic / camera toggles ----
 
 function setButtonIconState(button, isOff) {
-  button.classList.toggle('active', isOff);
-  const onIcon = button.querySelector('.icon-on');
-  const offIcon = button.querySelector('.icon-off');
+  button.classList.toggle("active", isOff);
+  const onIcon = button.querySelector(".icon-on");
+  const offIcon = button.querySelector(".icon-off");
   if (onIcon) onIcon.hidden = isOff;
   if (offIcon) offIcon.hidden = !isOff;
 }
 
-micBtn.addEventListener('click', () => {
+micBtn.addEventListener("click", () => {
   const track = localStream.getAudioTracks()[0];
   if (!track) return;
   track.enabled = !track.enabled;
   const isOff = !track.enabled;
   setButtonIconState(micBtn, isOff);
-  micBtn.title = isOff ? 'Unmute microphone' : 'Mute microphone';
+  micBtn.title = isOff ? "Unmute microphone" : "Mute microphone";
 });
 
-camBtn.addEventListener('click', () => {
+camBtn.addEventListener("click", () => {
   const track = localStream.getVideoTracks()[0];
   if (!track) return;
   track.enabled = !track.enabled;
   const isOff = !track.enabled;
   setButtonIconState(camBtn, isOff);
-  camBtn.title = isOff ? 'Turn camera on' : 'Turn camera off';
-  localVideo.classList.toggle('cam-off', isOff);
+  camBtn.title = isOff ? "Turn camera on" : "Turn camera off";
+  localVideo.classList.toggle("cam-off", isOff);
 });
 
 // ---- Chat ----
 
 function addChatMessage(text, who, timestamp) {
-  const div = document.createElement('div');
-  div.className = 'msg ' + who;
-  const time = new Date(timestamp || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  div.innerHTML = escapeHtml(text) + '<span class="time">' + time + '</span>';
+  const div = document.createElement("div");
+  div.className = "msg " + who;
+  const time = new Date(timestamp || Date.now()).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  div.innerHTML = escapeHtml(text) + '<span class="time">' + time + "</span>";
   chatMessages.appendChild(div);
   chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
 function escapeHtml(str) {
-  const d = document.createElement('div');
+  const d = document.createElement("div");
   d.textContent = str;
   return d.innerHTML;
+}
+
+// Rebuilds the whole chat log from the server's saved history — sent fresh
+// every time we (re)join a room, so this always reflects the source of
+// truth rather than layering on top of whatever the DOM already had
+// (which is what would cause duplicates after a signaling reconnect).
+function renderChatHistory(history) {
+  chatMessages.innerHTML = "";
+  history.forEach((m) =>
+    addChatMessage(m.text, m.from === myPeerId ? "me" : "them", m.timestamp),
+  );
+  chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
 function sendChat() {
   const text = chatInput.value.trim();
   if (!text) return;
   const timestamp = Date.now();
-  sendData({ type: 'chat', text, timestamp });
-  addChatMessage(text, 'me', timestamp);
-  chatInput.value = '';
+  // Sent over the signaling channel (not the WebRTC data channel) so it
+  // gets persisted server-side and doesn't depend on the peer connection
+  // being up yet.
+  sendChatToServer({ type: "chat", text, timestamp });
+  addChatMessage(text, "me", timestamp);
+  chatInput.value = "";
 }
 
-chatSendBtn.addEventListener('click', sendChat);
-chatInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') sendChat();
+chatSendBtn.addEventListener("click", sendChat);
+chatInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") sendChat();
 });
 
-chatBtn.addEventListener('click', () => {
-  chatPanel.classList.toggle('open');
-  chatBtn.classList.toggle('active', chatPanel.classList.contains('open'));
-  if (chatPanel.classList.contains('open')) {
-    chatBadge.classList.remove('show');
+chatBtn.addEventListener("click", () => {
+  chatPanel.classList.toggle("open");
+  chatBtn.classList.toggle("active", chatPanel.classList.contains("open"));
+  if (chatPanel.classList.contains("open")) {
+    chatBadge.classList.remove("show");
     chatInput.focus();
   }
 });
 
-const chatCloseBtn = document.getElementById('chatCloseBtn');
+const chatCloseBtn = document.getElementById("chatCloseBtn");
 if (chatCloseBtn) {
-  chatCloseBtn.addEventListener('click', () => {
-    chatPanel.classList.remove('open');
-    chatBtn.classList.remove('active');
+  chatCloseBtn.addEventListener("click", () => {
+    chatPanel.classList.remove("open");
+    chatBtn.classList.remove("active");
   });
 }
 
@@ -578,18 +846,20 @@ if (chatCloseBtn) {
 
 function initMapIfNeeded() {
   if (locationMap) return;
-  locationMap = L.map('locationMap', {
+  locationMap = L.map("locationMap", {
     zoomControl: false,
     attributionControl: false,
     dragging: false,
-    scrollWheelZoom: false
+    scrollWheelZoom: false,
   }).setView([0, 0], 13);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(locationMap);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png").addTo(
+    locationMap,
+  );
 }
 
 function showRemoteLocation(lat, lng, timestamp) {
   initMapIfNeeded();
-  locationPanel.classList.add('visible');
+  locationPanel.classList.add("visible");
   locationMap.setView([lat, lng], 15);
   if (locationMarker) {
     locationMarker.setLatLng([lat, lng]);
@@ -598,14 +868,17 @@ function showRemoteLocation(lat, lng, timestamp) {
   }
   setTimeout(() => locationMap.invalidateSize(), 50);
 
-  const time = new Date(timestamp || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const time = new Date(timestamp || Date.now()).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
   const mapsUrl = `https://www.google.com/maps?q=${lat},${lng}`;
   locationInfo.innerHTML = `Last update: ${time}<br><a href="${mapsUrl}" target="_blank" rel="noopener">Open in Google Maps</a>`;
 }
 
 function hideRemoteLocation() {
-  locationPanel.classList.remove('visible');
-  locationInfo.textContent = 'No location shared';
+  locationPanel.classList.remove("visible");
+  locationInfo.textContent = "No location shared";
 }
 
 function sendLocationNow() {
@@ -613,26 +886,26 @@ function sendLocationNow() {
   navigator.geolocation.getCurrentPosition(
     (pos) => {
       sendData({
-        type: 'location',
+        type: "location",
         lat: pos.coords.latitude,
         lng: pos.coords.longitude,
-        timestamp: Date.now()
+        timestamp: Date.now(),
       });
       lastLocationSendTime = Date.now();
     },
-    (err) => console.error('Geolocation error', err),
-    { enableHighAccuracy: false, maximumAge: 10000, timeout: 10000 }
+    (err) => console.error("Geolocation error", err),
+    { enableHighAccuracy: false, maximumAge: 10000, timeout: 10000 },
   );
 }
 
 function startSharingLocation() {
   if (!navigator.geolocation) {
-    alert('Geolocation is not available in this browser.');
+    alert("Geolocation is not available in this browser.");
     return;
   }
   sharingLocation = true;
-  locBtn.classList.add('on');
-  locBtn.title = 'Stop sharing location';
+  locBtn.classList.add("on");
+  locBtn.title = "Stop sharing location";
 
   sendLocationNow(); // send immediately
 
@@ -641,31 +914,31 @@ function startSharingLocation() {
       const now = Date.now();
       if (now - lastLocationSendTime >= LOCATION_MIN_INTERVAL_MS) {
         sendData({
-          type: 'location',
+          type: "location",
           lat: pos.coords.latitude,
           lng: pos.coords.longitude,
-          timestamp: now
+          timestamp: now,
         });
         lastLocationSendTime = now;
       }
     },
-    (err) => console.error('Geolocation error', err),
-    { enableHighAccuracy: false, maximumAge: 10000 }
+    (err) => console.error("Geolocation error", err),
+    { enableHighAccuracy: false, maximumAge: 10000 },
   );
 }
 
 function stopSharingLocation() {
   sharingLocation = false;
-  locBtn.classList.remove('on');
-  locBtn.title = 'Share location';
+  locBtn.classList.remove("on");
+  locBtn.title = "Share location";
   if (watchId !== null) {
     navigator.geolocation.clearWatch(watchId);
     watchId = null;
   }
-  sendData({ type: 'location-off' });
+  sendData({ type: "location-off" });
 }
 
-locBtn.addEventListener('click', () => {
+locBtn.addEventListener("click", () => {
   if (sharingLocation) {
     stopSharingLocation();
   } else {
@@ -673,4 +946,6 @@ locBtn.addEventListener('click', () => {
   }
 });
 
-init();
+// init() is no longer called unconditionally here — it now only runs once
+// a room code is settled (either from a shared invite link or the join
+// screen), via startCall() above.
