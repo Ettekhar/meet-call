@@ -197,21 +197,20 @@ if (copyLinkBtn) {
 }
 
 // ---- ICE server config ----
-// THIS IS THE MAIN FIX for "the other person on a different network can't
-// see me." STUN alone only helps two peers find each other when at least
-// one side has a NAT/firewall that's easy to traverse. A lot of real
-// networks — symmetric NAT home routers, corporate firewalls, mobile
-// carrier (CGNAT) networks — block direct peer-to-peer UDP entirely. In
-// that case the ONLY way the call can work is if the media is relayed
-// through a TURN server.
+// STUN-only, deliberately. No TURN server, no third-party account, no API
+// key, no signup of any kind — this is a zero-dependency setup on top of
+// what Cloudflare already gives us for free.
 //
-// The free openrelay.metered.ca TURN servers were tried here and confirmed
-// dead (every allocation attempt failed with TURN allocate errors / 701
-// connection failures — see console diagnostics). TURN credentials are now
-// fetched from our own Worker's /turn-credentials endpoint, which
-// generates short-lived Cloudflare Calls TURN credentials server-side.
-// STUN-only servers remain as a base so same-network calls still work even
-// if the TURN endpoint is briefly unavailable.
+// The trade-off that comes with this choice: STUN lets two browsers find
+// each other directly only when at least one side's NAT/firewall allows
+// it — true for most home Wi-Fi and most Wi-Fi<->cellular pairings, but
+// NOT true when both sides are behind a "hard" NAT (some cellular
+// carriers' CGNAT, some corporate/hotel networks). In that specific case
+// there is no direct path, and — with no TURN relay in the mix — the call
+// simply cannot connect. There's no silent degraded mode; it's a clean
+// "couldn't connect" rather than a stuck black screen (see
+// oniceconnectionstatechange below, which is what detects and reports
+// that case as soon as it happens instead of leaving the user guessing).
 const config = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
@@ -219,41 +218,6 @@ const config = {
   ],
   iceCandidatePoolSize: 10,
 };
-
-// Fetches real TURN credentials from our own Worker (see
-// worker-turn-snippet.js) and merges them into `config.iceServers`. Must
-// be awaited before the first createPeerConnection() call — otherwise the
-// offer/answer exchange starts gathering candidates with STUN only, which
-// is the exact failure mode we're fixing.
-async function loadTurnCredentials() {
-  try {
-    const res = await fetch("/turn-credentials");
-    if (!res.ok) throw new Error(`/turn-credentials returned ${res.status}`);
-    const turnServers = await res.json();
-    if (Array.isArray(turnServers) && turnServers.length > 0) {
-      config.iceServers = [...config.iceServers, ...turnServers];
-      console.log(
-        `Loaded ${turnServers.length} TURN server entr${turnServers.length === 1 ? "y" : "ies"}`,
-      );
-    } else {
-      console.warn(
-        "/turn-credentials returned no servers — cross-network calls will likely fail",
-      );
-    }
-  } catch (e) {
-    console.warn(
-      "Could not load TURN credentials — falling back to STUN-only. Cross-network calls will likely fail without a working TURN server.",
-      e,
-    );
-  }
-}
-
-// Diagnostic toggle: force ICE to only use relay (TURN) candidates, never
-// direct host/srflx ones. Turn this on temporarily (via the browser
-// console: `FORCE_RELAY = true` before the call connects) to prove
-// whether TURN itself is reachable and working, independent of whatever
-// direct-connection path might otherwise get selected.
-let FORCE_RELAY = false;
 
 // ---- Adaptive video quality ----
 // Three tiers we step between based on measured network conditions.
@@ -291,12 +255,13 @@ const STATS_CHECK_INTERVAL_MS = 3000;
 const HYSTERESIS_SAMPLES = 3; // require this many consecutive matching readings before switching
 
 // Prints exactly which kind of network path got selected: "host" (direct
-// LAN), "srflx" (STUN — direct over the internet), or "relay" (TURN). If
-// status says "Connected" but there's no video, checking this tells you
-// immediately whether it's a media/autoplay problem (candidate type is
-// fine, usually "relay" across different networks) or a connectivity
-// problem in disguise (no succeeded pair, or a pair that can't actually
-// carry traffic).
+// LAN) or "srflx" (STUN — direct over the internet). There's no TURN in
+// this build, so "relay" will never appear here — if ICE can't find a
+// host/srflx pair, the call fails outright (see oniceconnectionstatechange)
+// rather than falling back to a relay. If status says "Connected" but
+// there's no video, checking this tells you whether it's a media/autoplay
+// problem (a pair was found fine) or a connectivity problem in disguise
+// (no succeeded pair, or a pair that can't actually carry traffic).
 async function logSelectedCandidatePair() {
   if (!peerConnection) return;
   try {
@@ -481,7 +446,6 @@ function setRemoteEmptyState(visible) {
 }
 
 async function init() {
-  await loadTurnCredentials();
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
       video: {
@@ -567,9 +531,11 @@ async function flushPendingCandidates() {
 
 // A full call teardown is disruptive (camera/mic re-request, chat re-render,
 // etc). Before resorting to that, try an ICE restart — it renegotiates just
-// the transport (re-gathers candidates, re-tries TURN relays) without
-// touching the existing media tracks or data channel. Only the original
-// offerer drives this, same as the initial offer/answer.
+// the transport (re-gathers host/srflx candidates) without touching the
+// existing media tracks or data channel. Only useful once a direct path
+// has already been found once (see hasConnectedOnce below) — if no path
+// ever existed, restarting won't invent one. Only the original offerer
+// drives this, same as the initial offer/answer.
 async function attemptIceRestart() {
   if (!peerConnection || !isOfferer || iceRestartInFlight) return;
   iceRestartInFlight = true;
@@ -585,12 +551,12 @@ async function attemptIceRestart() {
   }
 }
 
+let hasConnectedOnce = false; // did this call ever reach "connected" at least once?
+
 function createPeerConnection() {
-  const pcConfig = FORCE_RELAY
-    ? { ...config, iceTransportPolicy: "relay" }
-    : config;
-  peerConnection = new RTCPeerConnection(pcConfig);
+  peerConnection = new RTCPeerConnection(config);
   pendingCandidates = [];
+  hasConnectedOnce = false;
 
   localStream.getTracks().forEach((track) => {
     peerConnection.addTrack(track, localStream);
@@ -622,8 +588,22 @@ function createPeerConnection() {
     const iceState = peerConnection.iceConnectionState;
     console.log("ICE connection state:", iceState);
     if (iceState === "failed") {
-      // Try to recover in place before falling back to a full teardown.
-      attemptIceRestart();
+      if (!hasConnectedOnce) {
+        // Never connected at all, and there's no TURN relay to fall back
+        // to — an ICE restart would just re-gather the same direct
+        // candidates and fail again the same way. This is the "different
+        // networks, no direct path exists" case: say so plainly instead
+        // of spinning.
+        setStatus(
+          "Couldn't connect directly — try both on the same Wi-Fi network.",
+          "",
+        );
+      } else {
+        // Was connected before; this looks like a transient path change
+        // (e.g. a Wi-Fi <-> cellular handoff) rather than "no path exists
+        // at all" — worth trying to recover in place.
+        attemptIceRestart();
+      }
     }
   };
 
@@ -649,6 +629,7 @@ function createPeerConnection() {
     const state = peerConnection.connectionState;
 
     if (state === "connected") {
+      hasConnectedOnce = true;
       clearConnectionLossTimer();
       setStatus("Connected", "connected");
       capAudioBitrate();
