@@ -294,6 +294,46 @@ function normalizeRoomCode(raw) {
     .slice(0, 32);
 }
 
+// Cache the generated TURN credentials for a while so we're not calling the
+// TURN provider's API on every single call setup. Metered's short-lived
+// credentials are typically valid for a good while; refreshing hourly keeps
+// them fresh without hammering the API.
+//
+// Set these two secrets first:
+//   wrangler secret put METERED_APP_NAME   (e.g. "yourapp", from yourapp.metered.live)
+//   wrangler secret put METERED_API_KEY
+const TURN_CACHE_MS = 55 * 60 * 1000; // ~55 minutes
+let cachedTurnServers = null;
+let cachedTurnExpiresAt = 0;
+
+async function getTurnServers(env) {
+  const now = Date.now();
+  if (cachedTurnServers && now < cachedTurnExpiresAt) {
+    return cachedTurnServers;
+  }
+
+  // Metered.ca — free tier, no credit card required. Sign up at
+  // https://dashboard.metered.ca/signup, create an app, and you'll get an
+  // app name (yourapp.metered.live) plus an API key. These are YOUR OWN
+  // private credentials, unlike the shared "openrelayproject" demo
+  // credentials that turned out to be dead/overloaded.
+  const resp = await fetch(
+    `https://${env.METERED_APP_NAME}.metered.live/api/v1/turn/credentials?apiKey=${env.METERED_API_KEY}`,
+  );
+
+  if (!resp.ok) {
+    const detail = await resp.text().catch(() => "");
+    throw new Error(`Metered TURN API returned ${resp.status}: ${detail}`);
+  }
+
+  // Metered's endpoint returns the iceServers array directly, already in
+  // the { urls, username, credential } shape RTCPeerConnection expects.
+  const iceServers = await resp.json();
+  cachedTurnServers = iceServers;
+  cachedTurnExpiresAt = now + TURN_CACHE_MS;
+  return cachedTurnServers;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -308,6 +348,28 @@ export default {
       const id = env.ROOM.idFromName(roomCode);
       const stub = env.ROOM.get(id);
       return stub.fetch(request);
+    }
+
+    if (url.pathname === "/turn-credentials") {
+      // Fetches TURN credentials from Metered.ca server-side, so the real
+      // METERED_API_KEY never reaches the browser — only the temporary
+      // iceServers list does. Without a working TURN relay here, two
+      // people on different networks (different NATs/firewalls) generally
+      // can't establish a direct WebRTC connection at all.
+      try {
+        const iceServers = await getTurnServers(env);
+        return new Response(JSON.stringify(iceServers), {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          },
+        });
+      } catch (e) {
+        return new Response(
+          JSON.stringify({ error: "Failed to generate TURN credentials" }),
+          { status: 502, headers: { "Content-Type": "application/json" } },
+        );
+      }
     }
 
     return env.ASSETS.fetch(request);

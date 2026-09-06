@@ -203,51 +203,50 @@ if (copyLinkBtn) {
 // networks — symmetric NAT home routers, corporate firewalls, mobile
 // carrier (CGNAT) networks — block direct peer-to-peer UDP entirely. In
 // that case the ONLY way the call can work is if the media is relayed
-// through a TURN server. Without one, ICE negotiation quietly fails and
-// you get exactly the symptom described: works fine on the same Wi-Fi,
-// breaks the moment the two people are on different networks.
+// through a TURN server.
 //
-// The `openrelay.metered.ca` TURN servers below are a free public relay —
-// good enough to prove this fixes your problem, but it's shared,
-// rate-limited, and has no uptime guarantee. Before shipping this to real
-// users, get your own TURN credentials from a provider such as:
-//   - Cloudflare Calls TURN (https://developers.cloudflare.com/calls/turn/)
-//   - Twilio Network Traversal Service
-//   - Metered.ca (paid tier)
-//   - Xirsys
-// and swap them in below.
+// The free openrelay.metered.ca TURN servers were tried here and confirmed
+// dead (every allocation attempt failed with TURN allocate errors / 701
+// connection failures — see console diagnostics). TURN credentials are now
+// fetched from our own Worker's /turn-credentials endpoint, which
+// generates short-lived Cloudflare Calls TURN credentials server-side.
+// STUN-only servers remain as a base so same-network calls still work even
+// if the TURN endpoint is briefly unavailable.
 const config = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
-    {
-      urls: "turn:openrelay.metered.ca:80",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
-    {
-      urls: "turn:openrelay.metered.ca:443",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
-    {
-      urls: "turn:openrelay.metered.ca:443?transport=tcp",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
-    // TURN-over-TLS (the "turns:" scheme, not just turn on port 443). Some
-    // corporate/school firewalls do deep packet inspection on port 443 and
-    // will pass through real TLS traffic but block anything else there,
-    // even plain TCP. turns: wraps the TURN traffic in an actual TLS
-    // handshake so it looks like normal HTTPS to that kind of firewall.
-    {
-      urls: "turns:openrelay.metered.ca:443?transport=tcp",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
   ],
   iceCandidatePoolSize: 10,
 };
+
+// Fetches real TURN credentials from our own Worker (see
+// worker-turn-snippet.js) and merges them into `config.iceServers`. Must
+// be awaited before the first createPeerConnection() call — otherwise the
+// offer/answer exchange starts gathering candidates with STUN only, which
+// is the exact failure mode we're fixing.
+async function loadTurnCredentials() {
+  try {
+    const res = await fetch("/turn-credentials");
+    if (!res.ok) throw new Error(`/turn-credentials returned ${res.status}`);
+    const turnServers = await res.json();
+    if (Array.isArray(turnServers) && turnServers.length > 0) {
+      config.iceServers = [...config.iceServers, ...turnServers];
+      console.log(
+        `Loaded ${turnServers.length} TURN server entr${turnServers.length === 1 ? "y" : "ies"}`,
+      );
+    } else {
+      console.warn(
+        "/turn-credentials returned no servers — cross-network calls will likely fail",
+      );
+    }
+  } catch (e) {
+    console.warn(
+      "Could not load TURN credentials — falling back to STUN-only. Cross-network calls will likely fail without a working TURN server.",
+      e,
+    );
+  }
+}
 
 // Diagnostic toggle: force ICE to only use relay (TURN) candidates, never
 // direct host/srflx ones. Turn this on temporarily (via the browser
@@ -482,6 +481,7 @@ function setRemoteEmptyState(visible) {
 }
 
 async function init() {
+  await loadTurnCredentials();
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
       video: {
