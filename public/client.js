@@ -235,9 +235,26 @@ const config = {
       username: "openrelayproject",
       credential: "openrelayproject",
     },
+    // TURN-over-TLS (the "turns:" scheme, not just turn on port 443). Some
+    // corporate/school firewalls do deep packet inspection on port 443 and
+    // will pass through real TLS traffic but block anything else there,
+    // even plain TCP. turns: wraps the TURN traffic in an actual TLS
+    // handshake so it looks like normal HTTPS to that kind of firewall.
+    {
+      urls: "turns:openrelay.metered.ca:443?transport=tcp",
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    },
   ],
   iceCandidatePoolSize: 10,
 };
+
+// Diagnostic toggle: force ICE to only use relay (TURN) candidates, never
+// direct host/srflx ones. Turn this on temporarily (via the browser
+// console: `FORCE_RELAY = true` before the call connects) to prove
+// whether TURN itself is reachable and working, independent of whatever
+// direct-connection path might otherwise get selected.
+let FORCE_RELAY = false;
 
 // ---- Adaptive video quality ----
 // Three tiers we step between based on measured network conditions.
@@ -273,6 +290,41 @@ let qualitySamples = []; // recent readings, used for hysteresis so quality does
 let statsInterval = null;
 const STATS_CHECK_INTERVAL_MS = 3000;
 const HYSTERESIS_SAMPLES = 3; // require this many consecutive matching readings before switching
+
+// Prints exactly which kind of network path got selected: "host" (direct
+// LAN), "srflx" (STUN — direct over the internet), or "relay" (TURN). If
+// status says "Connected" but there's no video, checking this tells you
+// immediately whether it's a media/autoplay problem (candidate type is
+// fine, usually "relay" across different networks) or a connectivity
+// problem in disguise (no succeeded pair, or a pair that can't actually
+// carry traffic).
+async function logSelectedCandidatePair() {
+  if (!peerConnection) return;
+  try {
+    const stats = await peerConnection.getStats();
+    let pairReport = null;
+    stats.forEach((report) => {
+      if (
+        report.type === "candidate-pair" &&
+        report.state === "succeeded" &&
+        report.nominated
+      ) {
+        pairReport = report;
+      }
+    });
+    if (!pairReport) {
+      console.log("[diagnostic] No succeeded/nominated candidate pair yet.");
+      return;
+    }
+    const local = stats.get(pairReport.localCandidateId);
+    const remote = stats.get(pairReport.remoteCandidateId);
+    console.log(
+      `[diagnostic] Active path — local: ${local && local.candidateType}, remote: ${remote && remote.candidateType}, bytesSent: ${pairReport.bytesSent}, bytesReceived: ${pairReport.bytesReceived}`,
+    );
+  } catch (e) {
+    console.warn("[diagnostic] getStats failed", e);
+  }
+}
 
 function getVideoSender() {
   if (!peerConnection) return null;
@@ -444,6 +496,12 @@ async function init() {
       },
     });
     localVideo.srcObject = localStream;
+    localVideo.autoplay = true;
+    localVideo.playsInline = true;
+    localVideo.muted = true; // local preview must be muted or autoplay gets blocked
+    localVideo.play().catch((err) => {
+      console.warn("Local video play() was blocked:", err);
+    });
     setStatus("Waiting for the other person to join...", "waiting");
     setRemoteEmptyState(true);
     connectSignaling();
@@ -481,7 +539,10 @@ async function addIceCandidateSafely(candidate) {
     pendingCandidates.push(candidate);
     return;
   }
-  if (peerConnection.remoteDescription && peerConnection.remoteDescription.type) {
+  if (
+    peerConnection.remoteDescription &&
+    peerConnection.remoteDescription.type
+  ) {
     try {
       await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
     } catch (err) {
@@ -525,7 +586,10 @@ async function attemptIceRestart() {
 }
 
 function createPeerConnection() {
-  peerConnection = new RTCPeerConnection(config);
+  const pcConfig = FORCE_RELAY
+    ? { ...config, iceTransportPolicy: "relay" }
+    : config;
+  peerConnection = new RTCPeerConnection(pcConfig);
   pendingCandidates = [];
 
   localStream.getTracks().forEach((track) => {
@@ -533,7 +597,19 @@ function createPeerConnection() {
   });
 
   peerConnection.ontrack = (event) => {
-    remoteVideo.srcObject = event.streams[0];
+    // Some browsers won't autoplay a stream assigned via srcObject if the
+    // element's autoplay/playsInline weren't already set before the stream
+    // arrived — the frame just sits there black instead of erroring
+    // visibly. Setting these from JS and explicitly calling play() removes
+    // the dependency on the HTML markup being exactly right.
+    remoteVideo.autoplay = true;
+    remoteVideo.playsInline = true;
+    if (remoteVideo.srcObject !== event.streams[0]) {
+      remoteVideo.srcObject = event.streams[0];
+    }
+    remoteVideo.play().catch((err) => {
+      console.warn("Remote video play() was blocked:", err);
+    });
     setRemoteEmptyState(false);
     setStatus("Connected", "connected");
   };
@@ -563,6 +639,11 @@ function createPeerConnection() {
       setStatus("Connected", "connected");
       capAudioBitrate();
       startQualityMonitor();
+      logSelectedCandidatePair();
+      // Check again after a few seconds — if bytesReceived is still 0 at
+      // that point, the "connected" state is misleading and no media is
+      // actually arriving.
+      setTimeout(logSelectedCandidatePair, 4000);
     } else if (state === "disconnected" || state === "failed") {
       // Don't panic immediately — this fires on brief hiccups too. Show a
       // soft "reconnecting" state and only actually tear the call down if
