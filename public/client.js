@@ -196,10 +196,47 @@ if (copyLinkBtn) {
   });
 }
 
+// ---- ICE server config ----
+// THIS IS THE MAIN FIX for "the other person on a different network can't
+// see me." STUN alone only helps two peers find each other when at least
+// one side has a NAT/firewall that's easy to traverse. A lot of real
+// networks — symmetric NAT home routers, corporate firewalls, mobile
+// carrier (CGNAT) networks — block direct peer-to-peer UDP entirely. In
+// that case the ONLY way the call can work is if the media is relayed
+// through a TURN server. Without one, ICE negotiation quietly fails and
+// you get exactly the symptom described: works fine on the same Wi-Fi,
+// breaks the moment the two people are on different networks.
+//
+// The `openrelay.metered.ca` TURN servers below are a free public relay —
+// good enough to prove this fixes your problem, but it's shared,
+// rate-limited, and has no uptime guarantee. Before shipping this to real
+// users, get your own TURN credentials from a provider such as:
+//   - Cloudflare Calls TURN (https://developers.cloudflare.com/calls/turn/)
+//   - Twilio Network Traversal Service
+//   - Metered.ca (paid tier)
+//   - Xirsys
+// and swap them in below.
 const config = {
-  // Public STUN server so both browsers can find each other over the internet.
-  // Just NAT traversal, not an authentication/security layer.
-  iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    {
+      urls: "turn:openrelay.metered.ca:80",
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    },
+    {
+      urls: "turn:openrelay.metered.ca:443",
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    },
+    {
+      urls: "turn:openrelay.metered.ca:443?transport=tcp",
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    },
+  ],
+  iceCandidatePoolSize: 10,
 };
 
 // ---- Adaptive video quality ----
@@ -430,8 +467,66 @@ function clearConnectionLossTimer() {
   }
 }
 
+// ICE candidates that arrive over signaling before setRemoteDescription has
+// finished can't be applied yet (RTCPeerConnection throws if you try). They
+// used to just get dropped, silently reducing the pool of candidate pairs
+// ICE had to work with — which matters a lot for cross-network connections
+// where you're relying on TURN/relay candidates to succeed. Now they're
+// queued and flushed the moment the remote description is set.
+let pendingCandidates = [];
+let iceRestartInFlight = false;
+
+async function addIceCandidateSafely(candidate) {
+  if (!peerConnection) {
+    pendingCandidates.push(candidate);
+    return;
+  }
+  if (peerConnection.remoteDescription && peerConnection.remoteDescription.type) {
+    try {
+      await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (err) {
+      console.error("Error adding ICE candidate", err);
+    }
+  } else {
+    pendingCandidates.push(candidate);
+  }
+}
+
+async function flushPendingCandidates() {
+  const queued = pendingCandidates;
+  pendingCandidates = [];
+  for (const candidate of queued) {
+    try {
+      await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (err) {
+      console.error("Error adding queued ICE candidate", err);
+    }
+  }
+}
+
+// A full call teardown is disruptive (camera/mic re-request, chat re-render,
+// etc). Before resorting to that, try an ICE restart — it renegotiates just
+// the transport (re-gathers candidates, re-tries TURN relays) without
+// touching the existing media tracks or data channel. Only the original
+// offerer drives this, same as the initial offer/answer.
+async function attemptIceRestart() {
+  if (!peerConnection || !isOfferer || iceRestartInFlight) return;
+  iceRestartInFlight = true;
+  try {
+    console.log("Attempting ICE restart");
+    const offer = await peerConnection.createOffer({ iceRestart: true });
+    await peerConnection.setLocalDescription(offer);
+    sendSignal({ type: "signal", signal: { type: "offer", sdp: offer } });
+  } catch (e) {
+    console.warn("ICE restart failed", e);
+  } finally {
+    iceRestartInFlight = false;
+  }
+}
+
 function createPeerConnection() {
   peerConnection = new RTCPeerConnection(config);
+  pendingCandidates = [];
 
   localStream.getTracks().forEach((track) => {
     peerConnection.addTrack(track, localStream);
@@ -441,6 +536,23 @@ function createPeerConnection() {
     remoteVideo.srcObject = event.streams[0];
     setRemoteEmptyState(false);
     setStatus("Connected", "connected");
+  };
+
+  // Fine-grained ICE state, mainly for diagnosing exactly where a
+  // cross-network connection is failing (stuck in "checking" usually means
+  // no viable candidate pair was found — i.e. TURN is needed and either
+  // missing or itself unreachable).
+  peerConnection.oniceconnectionstatechange = () => {
+    const iceState = peerConnection.iceConnectionState;
+    console.log("ICE connection state:", iceState);
+    if (iceState === "failed") {
+      // Try to recover in place before falling back to a full teardown.
+      attemptIceRestart();
+    }
+  };
+
+  peerConnection.onicegatheringstatechange = () => {
+    console.log("ICE gathering state:", peerConnection.iceGatheringState);
   };
 
   peerConnection.onconnectionstatechange = () => {
@@ -643,6 +755,8 @@ function resetCallState() {
     peerConnection = null;
   }
   dataChannel = null;
+  pendingCandidates = [];
+  isOfferer = false;
   remoteVideo.srcObject = null;
   setRemoteEmptyState(true);
   hideRemoteLocation();
@@ -716,6 +830,7 @@ async function handleSignalingMessage(data) {
       await peerConnection.setRemoteDescription(
         new RTCSessionDescription(signal.sdp),
       );
+      await flushPendingCandidates();
       const answer = await peerConnection.createAnswer();
       await peerConnection.setLocalDescription(answer);
       sendSignal({ type: "signal", signal: { type: "answer", sdp: answer } });
@@ -723,14 +838,9 @@ async function handleSignalingMessage(data) {
       await peerConnection.setRemoteDescription(
         new RTCSessionDescription(signal.sdp),
       );
+      await flushPendingCandidates();
     } else if (signal.type === "candidate") {
-      try {
-        await peerConnection.addIceCandidate(
-          new RTCIceCandidate(signal.candidate),
-        );
-      } catch (err) {
-        console.error("Error adding ICE candidate", err);
-      }
+      await addIceCandidateSafely(signal.candidate);
     }
     return;
   }
