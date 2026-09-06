@@ -631,6 +631,20 @@ function createPeerConnection() {
     console.log("ICE gathering state:", peerConnection.iceGatheringState);
   };
 
+  // Fires once per STUN/TURN server that fails to respond or rejects the
+  // request — e.g. wrong/expired TURN credentials, the TURN server being
+  // unreachable from this network, or a timeout. errorCode 401/403 means
+  // the TURN server is up but rejected our credentials; a STUN-style
+  // timeout with no errorCode usually means that server (or that port/
+  // transport) is blocked by the network entirely. This is the direct
+  // evidence for why ICE is stuck in "checking" -> "disconnected" with no
+  // working candidate pair.
+  peerConnection.onicecandidateerror = (event) => {
+    console.warn(
+      `[ice-error] url=${event.url} errorCode=${event.errorCode} errorText=${event.errorText} address=${event.address} port=${event.port}`,
+    );
+  };
+
   peerConnection.onconnectionstatechange = () => {
     const state = peerConnection.connectionState;
 
